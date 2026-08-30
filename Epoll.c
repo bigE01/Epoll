@@ -27,6 +27,28 @@ typedef struct{
     int used_len;
 } connection;
 
+// Keeps calling send() until all 'length' bytes have been sent,
+// since a single send() call isn't guaranteed to send everything at once.
+// Returns 0 on success, -1 if a real error occurs partway through.
+int send_all(int fd, const void *data, size_t length)
+{
+    size_t total_sent = 0;
+    const char *ptr = data;  // char* so we can do pointer arithmetic in bytes
+
+    while (total_sent < length) {
+        ssize_t sent = send(fd, ptr + total_sent, length - total_sent, 0);
+        if (sent == -1) {
+            if (errno == EAGAIN) {
+                continue;  // socket temporarily can't accept more — retry
+            }
+            perror("send failed");
+            return -1;  // real error
+        }
+        total_sent += sent;
+    }
+    return 0;
+}
+
 void close_connection(int fd, connection *connections[MAX_FDS], int ep_fd)
 {
     epoll_ctl(ep_fd, EPOLL_CTL_DEL, fd, NULL);
@@ -49,37 +71,6 @@ connection *create_connection(int fd)
 
     return conn;
 }
-
-// void run_server()
-// {
-//     while(1)
-//     {
-//         int n = epoll_wait(ep_fd, event, MAX_EVENTS, -1);
-//         for (int i = 0; i < n; i++)
-//         {
-//             int fd = event[i].data.fd;
-//             if(fd < 0)
-//             {
-//                 perror("fd was un succesfull");
-//             }
-//             int client_fd = socket(AF_INET, SOCK_STREAM, 0);
-//             if(fd == listeningfd)
-//             {
-//                 //new data
-//                 accept();
-//                 recv(client_fd);
-//                 if (memmem(buffer,used_len,"\r\n\r\n",4) == true)
-//                 {
-
-//                 }
-//             }
-//             else
-//             {
-//             //existing connection has data
-//             }
-//         }
-//     }
-// }
 
 int main(int argc, char *argv[])
 {   
@@ -174,22 +165,85 @@ int main(int argc, char *argv[])
                     //connection not closed yet
                     connections[fd] -> used_len += status;
                     void *found = memmem(connections[fd]->buffer, connections[fd]->used_len,"\r\n\r\n", 4);
-                    if (found == NULL) 
+                    if (found != NULL) 
                     {
+                        // The request line looks like: "GET /index.html HTTP/1.1\r\n..."
+                        // space1 = position of the space right after the method (GET)
+                        // space2 = position of the space right after the path
+                        char *space1 = strchr(connections[fd]->buffer, ' ');
+                        char *space2 = strchr(space1 + 1, ' ');
+                        if (space1 == NULL || space2 == NULL) {
+                            close_connection(fd, connections, ep_fd);
+                            continue;
+                        }
 
+                        // Copy just the path substring into its own buffer
+                        char path[256];
+                        size_t path_len = space2 - space1 - 1;
+                        memcpy(path, space1 + 1, path_len);
+                        path[path_len] = '\0';
 
-                        
-                    }
-                    else
-                    {
-                        connections[fd] -> done = 1;
-                        const char *response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-                        int respond = send(fd, response, strlen(response), 0);
+                        // Reject path traversal attempts BEFORE building any real filesystem path
+                        if (strstr(path, "..") != NULL) {
+                            close_connection(fd, connections, ep_fd);
+                            continue;
+                        }
+
+                        // Build the real filesystem path from the web root + requested path
+                        char full_path[512];
+                        snprintf(full_path, sizeof(full_path), "www%s", path);
+                        printf("full_path: %s\n", full_path);
+                        fflush(stdout);
+
+                        // Try to open the requested file
+                        FILE *file = fopen(full_path, "rb");
+                        if (file == NULL) {
+                        perror("404 file not found");
+                        const char *response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                        send_all(fd, response, strlen(response));
                         close_connection(fd, connections, ep_fd);
-                        if (errno == EAGAIN) continue;
-                    }
+                        continue;
+                        }
 
-                }   
+                        // Find the file's size: seek to the end, ask the position, seek back to the start
+                        fseek(file, 0, SEEK_END);
+                        long file_size = ftell(file);
+                        fseek(file, 0, SEEK_SET);
+
+                        // Allocate a buffer sized to hold the whole file
+                        char *file_data = malloc(file_size);
+                        if (file_data == NULL) {
+                            fclose(file);
+                            close_connection(fd, connections, ep_fd);
+                            continue;
+                        }
+
+                        // Read the file's bytes into file_data, and confirm we got all of them
+                        size_t bytes_read = fread(file_data, 1, file_size, file);
+                        if (bytes_read != (size_t)file_size) {
+                            free(file_data);
+                            fclose(file);
+                            close_connection(fd, connections, ep_fd);
+                            continue;
+                        }
+
+                        // Build the HTTP header with the real file size, and send it,
+                        // then send the file's raw bytes separately (file_data may be
+                        // binary, so it can't be safely combined into one string with %s)
+                        char header[256];
+                        snprintf(header, sizeof(header),
+                            "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n\r\n", file_size);
+                        send_all(fd, header, strlen(header));
+                        send_all(fd, file_data, file_size);
+
+                        connections[fd]->done = 1;
+
+                        // Clean up: free the file buffer, close the FILE*, close the connection
+                        free(file_data);
+                        fclose(file);
+                        close_connection(fd, connections, ep_fd);
+                    }
+                 }   
             }
         }
     }
