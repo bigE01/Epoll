@@ -1,5 +1,8 @@
 #define MAX_LENGTH 1024 
 #define _GNU_SOURCE
+#define NUM_WORRKERS 4
+#define QUEUE_SIZE 20
+#define MAX_FDS 100
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -14,8 +17,8 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <fcntl.h>
+#include <pthread.h>
 
-int MAX_FDS = 100;
 int PORT = 8081;
 int MAX_EVENTS = 10;
 int BACKLOG = 5;
@@ -26,6 +29,68 @@ typedef struct{
     char buffer[MAX_LENGTH];
     int used_len;
 } connection;
+
+typedef struct{
+    int workingFd;
+    char dullPath[512];
+} job;
+
+typedef struct {
+    job jobs[QUEUE_SIZE];
+    int count;              // how many jobs are currently waiting
+    int front;              // index of the next job to pop
+    int back;                // index where the next pushed job goes
+    pthread_mutex_t lock;
+    pthread_cond_t not_empty;
+} job_queue;
+
+job_queue queue;
+connection *connections[MAX_FDS];
+int ep_fd;
+
+void queue_init(job_queue *q)
+{
+    q->count = 0;
+    q->front = 0;
+    q->back = 0;
+    pthread_mutex_init(&q->lock, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+}
+
+// Called by the epoll thread once a request is fully parsed.
+int queue_push(job_queue *q, job new_job)
+{
+    pthread_mutex_lock(&q->lock);
+    if (q->count == QUEUE_SIZE) 
+    {
+        pthread_mutex_unlock(&q->lock);
+        return -1;
+    }
+    q->jobs[q->back] = new_job;
+    q->back = (q->back + 1) % QUEUE_SIZE;   // wrap around, circular buffer
+    q->count++;
+
+    pthread_cond_signal(&q->not_empty);      // wake up one sleeping worker, if any
+    pthread_mutex_unlock(&q->lock);
+    return 0;
+}
+
+// Called by a worker thread. Blocks (sleeps, no CPU spent) if the queue is empty.
+job queue_pop(job_queue *q)
+{
+    pthread_mutex_lock(&q->lock);
+
+    while (q->count == 0) {
+        // Releases the lock while sleeping, reacquires it automatically upon waking.
+        pthread_cond_wait(&q->not_empty, &q->lock);
+    }
+    job result = q->jobs[q->front];
+    q->front = (q->front + 1) % QUEUE_SIZE;
+    q->count--;
+
+    pthread_mutex_unlock(&q->lock);
+    return result;
+}
 
 // Keeps calling send() until all 'length' bytes have been sent,
 // since a single send() call isn't guaranteed to send everything at once.
@@ -72,11 +137,58 @@ connection *create_connection(int fd)
     return conn;
 }
 
+// pthread_create requires this exact signature: takes and returns void*.
+void *worker_thread(void *arg)
+{
+    job_queue *q = (job_queue *)arg;
+
+    while (1) {
+        job current_job = queue_pop(q);
+        int fd = current_job.workingFd;
+
+        FILE *file = fopen(current_job.dullPath, "rb");
+        if (file == NULL) {
+            const char *response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            send_all(fd, response, strlen(response));
+            close_connection(fd, connections, ep_fd);
+            continue;
+        }
+
+        fseek(file, 0, SEEK_END);
+        long file_size = ftell(file);
+        fseek(file, 0, SEEK_SET);
+
+        char *file_data = malloc(file_size);
+        if (file_data == NULL) {
+            fclose(file);
+            close_connection(fd, connections, ep_fd);
+            continue;
+        }
+
+        size_t bytes_read = fread(file_data, 1, file_size, file);
+        if (bytes_read != (size_t)file_size) {
+            free(file_data);
+            fclose(file);
+            close_connection(fd, connections, ep_fd);
+            continue;
+        }
+
+        char header[256];
+        snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n\r\n", file_size);
+        send_all(fd, header, strlen(header));
+        send_all(fd, file_data, file_size);
+
+        free(file_data);
+        fclose(file);
+        close_connection(fd, connections, ep_fd);
+    }
+    return NULL;
+}
+
 int main(int argc, char *argv[])
 {   
-    //epoll_wait();
     struct epoll_event events[MAX_EVENTS];
-    connection *connections[MAX_FDS]; 
     struct sockaddr_in sock_addr;
     sock_addr.sin_family = AF_INET;
     sock_addr.sin_addr.s_addr = INADDR_ANY;
@@ -94,13 +206,19 @@ int main(int argc, char *argv[])
     int sock_listener = listen(socket_fd, BACKLOG);
     if (sock_listener == -1)
     { perror("socket listening failled"); exit(EXIT_FAILURE);}    
-    int ep_fd = epoll_create1(0);
+    ep_fd = epoll_create1(0);
     if (ep_fd == -1)
     { perror("epol create failled"); exit(EXIT_FAILURE);}   
     events[0].events = EPOLLIN;
     events[0].data.fd = socket_fd;
     if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, socket_fd, &events[0]) == -1)
     {perror("epoll_ctl failed for listening socket"); exit(EXIT_FAILURE);}
+    queue_init(&queue);
+    pthread_t workers[4];
+    job new_job;
+    for (int i = 0; i < NUM_WORRKERS; i++) {
+    pthread_create(&workers[i], NULL, worker_thread, &queue);
+    }
     while(1)
     {
         int n = epoll_wait(ep_fd, events, MAX_EVENTS, -1);
@@ -167,7 +285,7 @@ int main(int argc, char *argv[])
                     void *found = memmem(connections[fd]->buffer, connections[fd]->used_len,"\r\n\r\n", 4);
                     if (found != NULL) 
                     {
-                        // The request line looks like: "GET /index.html HTTP/1.1\r\n..."
+                        // getitng the url of the file recived
                         // space1 = position of the space right after the method (GET)
                         // space2 = position of the space right after the path
                         char *space1 = strchr(connections[fd]->buffer, ' ');
@@ -194,59 +312,21 @@ int main(int argc, char *argv[])
                         snprintf(full_path, sizeof(full_path), "www%s", path);
                         printf("full_path: %s\n", full_path);
                         fflush(stdout);
-
-                        // Try to open the requested file
-                        FILE *file = fopen(full_path, "rb");
-                        if (file == NULL) {
-                        perror("404 file not found");
-                        const char *response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                        send_all(fd, response, strlen(response));
-                        close_connection(fd, connections, ep_fd);
-                        continue;
-                        }
-
-                        // Find the file's size: seek to the end, ask the position, seek back to the start
-                        fseek(file, 0, SEEK_END);
-                        long file_size = ftell(file);
-                        fseek(file, 0, SEEK_SET);
-
-                        // Allocate a buffer sized to hold the whole file
-                        char *file_data = malloc(file_size);
-                        if (file_data == NULL) {
-                            fclose(file);
+                        new_job.workingFd = fd;
+                        strncpy(new_job.dullPath, full_path, sizeof(new_job.dullPath));
+                        if (queue_push(&queue, new_job) == -1) {
+                            const char *response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+                            send_all(fd, response, strlen(response));
                             close_connection(fd, connections, ep_fd);
-                            continue;
                         }
-
-                        // Read the file's bytes into file_data, and confirm we got all of them
-                        size_t bytes_read = fread(file_data, 1, file_size, file);
-                        if (bytes_read != (size_t)file_size) {
-                            free(file_data);
-                            fclose(file);
-                            close_connection(fd, connections, ep_fd);
-                            continue;
-                        }
-
-                        // Build the HTTP header with the real file size, and send it,
-                        // then send the file's raw bytes separately (file_data may be
-                        // binary, so it can't be safely combined into one string with %s)
-                        char header[256];
-                        snprintf(header, sizeof(header),
-                            "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n\r\n", file_size);
-                        send_all(fd, header, strlen(header));
-                        send_all(fd, file_data, file_size);
-
-                        connections[fd]->done = 1;
-
-                        // Clean up: free the file buffer, close the FILE*, close the connection
-                        free(file_data);
-                        fclose(file);
-                        close_connection(fd, connections, ep_fd);
+                        queue_push(&queue, new_job);
+                        // new_job.workingFd = fd;
+                        // strncpy(new_job.dullPath, full_path, sizeof(new_job.dullPath));
+                        // queue_push(&queue, new_job);
                     }
-                 }   
+                }   
             }
         }
     }
-    //int bind_result = bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
     return 0;
 }
