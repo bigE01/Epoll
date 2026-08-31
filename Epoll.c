@@ -18,7 +18,9 @@
 #include <sys/time.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 
+volatile sig_atomic_t running = 1;
 int PORT = 8081;
 int MAX_EVENTS = 10;
 int BACKLOG = 5;
@@ -47,6 +49,11 @@ typedef struct {
 job_queue queue;
 connection *connections[MAX_FDS];
 int ep_fd;
+
+void handle_sigterm(int sig) {
+    (void)sig;       // unused, silences a compiler warning
+    running = 0;
+}
 
 void queue_init(job_queue *q)
 {
@@ -188,6 +195,15 @@ void *worker_thread(void *arg)
 
 int main(int argc, char *argv[])
 {   
+    struct sigaction sa;
+    sa.sa_handler = handle_sigterm;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;   // deliberately NOT using SA_RESTART, so epoll_wait gets interrupted
+    if (sigaction(SIGTERM, &sa, NULL) == -1) 
+    {
+        perror("sigaction failed");
+        exit(EXIT_FAILURE);
+    }
     struct epoll_event events[MAX_EVENTS];
     struct sockaddr_in sock_addr;
     sock_addr.sin_family = AF_INET;
@@ -219,9 +235,16 @@ int main(int argc, char *argv[])
     for (int i = 0; i < NUM_WORRKERS; i++) {
     pthread_create(&workers[i], NULL, worker_thread, &queue);
     }
-    while(1)
+    while(running)
     {
         int n = epoll_wait(ep_fd, events, MAX_EVENTS, -1);
+        if (n == -1) {
+            if (errno == EINTR) {
+                continue;   // interrupted by the signal — loop back, 'while(running)' catches the exit
+            }
+            perror("epoll_wait failed");
+            break;
+        }
         for (int i = 0; i < n; i++)
         {
             int fd = events[i].data.fd;
@@ -238,6 +261,8 @@ int main(int argc, char *argv[])
                 //checks that the connection didnt fail
                 if (client_fd == -1)
                 { perror("accept failled"); continue;}
+                if (client_fd >= MAX_FDS)
+                { perror("client_fd exceeds MAX_FDS, rejecting connection"); close(client_fd);
                 fcntl(client_fd, F_SETFL, O_NONBLOCK);
                 new_event.events = EPOLLIN;
                 new_event.data.fd = client_fd;
@@ -298,6 +323,10 @@ int main(int argc, char *argv[])
                         // Copy just the path substring into its own buffer
                         char path[256];
                         size_t path_len = space2 - space1 - 1;
+                        if (path_len >= sizeof(path)) {
+                            close_connection(fd, connections, ep_fd);
+                            continue;
+                        }
                         memcpy(path, space1 + 1, path_len);
                         path[path_len] = '\0';
 
@@ -319,14 +348,12 @@ int main(int argc, char *argv[])
                             send_all(fd, response, strlen(response));
                             close_connection(fd, connections, ep_fd);
                         }
-                        queue_push(&queue, new_job);
-                        // new_job.workingFd = fd;
-                        // strncpy(new_job.dullPath, full_path, sizeof(new_job.dullPath));
-                        // queue_push(&queue, new_job);
                     }
                 }   
             }
         }
     }
+    close(socket_fd);
+    printf("Server shutting down cleanly\n");
     return 0;
 }

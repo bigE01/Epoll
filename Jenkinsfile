@@ -15,10 +15,11 @@ pipeline {
             }
         }
         stage('Compile & Run') {
-            steps {
-                timeout(time: 30, unit: 'SECONDS') {
-                    sh '''
+    steps {
+        timeout(time: 30, unit: 'SECONDS') {
+            sh '''
 docker run --rm -i ${epoll_container} sh <<'SCRIPT'
+apt-get update && apt-get install -y curl
 gcc Epoll.c -o epoll -pthread
 ./epoll &
 SERVER_PID=$!
@@ -27,19 +28,26 @@ if ! kill -0 $SERVER_PID 2>/dev/null; then
   echo "Server failed to start or crashed immediately"
   exit 1
 fi
-kill -TERM $SERVER_PID
-wait $SERVER_PID
-EXIT_CODE=$?
-if [ $EXIT_CODE -ne 0 ]; then
-  echo "Server did not shut down cleanly, exit code: $EXIT_CODE"
+RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" localhost:8081/index.html)
+if [ "$RESPONSE" != "200" ]; then
+  echo "Expected 200 from index.html, got $RESPONSE"
+  kill -TERM $SERVER_PID
   exit 1
 fi
-echo "Server started and shut down cleanly"
+RESPONSE_404=$(curl -s -o /dev/null -w "%{http_code}" localhost:8081/nope.html)
+if [ "$RESPONSE_404" != "404" ]; then
+  echo "Expected 404 from nope.html, got $RESPONSE_404"
+  kill -TERM $SERVER_PID
+  exit 1
+fi
+kill -TERM $SERVER_PID
+wait $SERVER_PID
+echo "Server started, served requests correctly, and shut down cleanly"
 SCRIPT
-                    '''
-                }
-            }
+'''
         }
+    }
+}
     }
     post {
         always {
