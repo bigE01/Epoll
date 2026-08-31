@@ -19,7 +19,7 @@ pipeline {
                 timeout(time: 30, unit: 'SECONDS') {
                     sh '''
 docker run --rm -i ${epoll_container} sh <<'SCRIPT'
-gcc epoll.c -o epoll -pthread
+gcc Epoll.c -o epoll -pthread
 ./epoll &
 SERVER_PID=$!
 sleep 1
