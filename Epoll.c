@@ -262,7 +262,7 @@ int main(int argc, char *argv[])
                 if (client_fd == -1)
                 { perror("accept failled"); continue;}
                 if (client_fd >= MAX_FDS)
-                { perror("client_fd exceeds MAX_FDS, rejecting connection"); close(client_fd);
+                { perror("client_fd exceeds MAX_FDS, rejecting connection"); close(client_fd); continue; }
                 fcntl(client_fd, F_SETFL, O_NONBLOCK);
                 new_event.events = EPOLLIN;
                 new_event.data.fd = client_fd;
@@ -351,8 +351,7 @@ int main(int argc, char *argv[])
                     }
                 }   
             }
-        }
-    
+        }   
     }
     close(socket_fd);
     printf("Server shutting down cleanly\n");
