@@ -352,9 +352,9 @@ int main(int argc, char *argv[])
                 }   
             }
         }
+    
     }
     close(socket_fd);
     printf("Server shutting down cleanly\n");
     return 0;
-}
 }
